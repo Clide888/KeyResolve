@@ -20,6 +20,16 @@ This approach works reliably on **Wayland**, **X11**, and in **games that use ra
 
 ## Installation
 
+### Install from the AUR
+
+```
+yay -S keyresolve-git
+# OR
+paru -S keyresolve-git
+```
+
+See https://aur.archlinux.org/packages/keyresolve-git
+
 ### Download from GitHub Releases
 
 Navigate to the [Releases](https://github.com/Antosser/KeyResolve/releases) and download the binary for your architecture.
@@ -47,7 +57,7 @@ target/release/KeyResolve
 
 ### Create a udev rule
 
-Create `/etc/udev/rules.d/99-input.rules`:
+Create `/etc/udev/rules.d/99-input.rules` (automatically created when intalled via the AUR):
 
 ```ini
 KERNEL=="event*", SUBSYSTEM=="input", GROUP="input", MODE="660"
