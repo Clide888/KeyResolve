@@ -16,41 +16,48 @@ use std::{
 pub type Keyboard = (PathBuf, Device);
 const VIRTUAL_SUFFIX: &str = " (KeyResolve)";
 
-/// A keyboard discovered from sysfs. Unlike opening /dev/input/eventX, this does
-/// not require device permissions, so setup can list keyboards before the
-/// one-time udev/group permission helper has run.
+/// A keyboard candidate for the setup picker. Sysfs metadata can be read before
+/// device permissions are granted; after the permission helper runs, evdev can
+/// also open the device and confirm its capabilities directly.
 pub struct KeyboardCandidate {
     pub path: PathBuf,
     pub identity: SavedKeyboard,
 }
 
+/// Discover keyboards without requiring sudo. Sysfs metadata is readable before
+/// device permissions are granted; after the permission helper runs, also merge
+/// in devices opened through evdev so setup does not depend on sysfs alone.
 pub fn enumerate_candidates() -> Vec<KeyboardCandidate> {
-    let mut candidates = Vec::new();
-    let Ok(entries) = fs::read_dir("/sys/class/input") else {
-        return candidates;
-    };
-    for entry in entries.flatten() {
-        let filename = entry.file_name();
-        let Some(name) = filename.to_str() else {
-            continue;
-        };
-        if !name.starts_with("event") {
-            continue;
+    let mut by_path = std::collections::BTreeMap::new();
+    if let Ok(entries) = fs::read_dir("/sys/class/input") {
+        for entry in entries.flatten() {
+            let filename = entry.file_name();
+            let Some(name) = filename.to_str() else {
+                continue;
+            };
+            if !name.starts_with("event") {
+                continue;
+            }
+            let device_dir = entry.path().join("device");
+            let path = Path::new("/dev/input").join(name);
+            let Some(identity) = read_identity(&device_dir, path.clone()) else {
+                continue;
+            };
+            if !is_likely_keyboard_sysfs(&device_dir) || is_keyresolve_identity(&identity) {
+                continue;
+            }
+            by_path.insert(path.clone(), KeyboardCandidate { path, identity });
         }
-        let device_dir = entry.path().join("device");
-        let Some(identity) = read_identity(&device_dir, Path::new("/dev/input").join(name)) else {
-            continue;
-        };
-        if !is_likely_keyboard_sysfs(&device_dir) || is_keyresolve_identity(&identity) {
-            continue;
-        }
-        candidates.push(KeyboardCandidate {
-            path: Path::new("/dev/input").join(name),
-            identity,
-        });
     }
-    candidates.sort_by(|a, b| a.path.cmp(&b.path));
-    candidates
+    for (path, device) in enumerate_keyboards() {
+        by_path
+            .entry(path.clone())
+            .or_insert_with(|| KeyboardCandidate {
+                identity: SavedKeyboard::from_device(&path, &device),
+                path,
+            });
+    }
+    by_path.into_values().collect()
 }
 
 fn read_string(path: &Path) -> Option<String> {
@@ -89,19 +96,19 @@ fn is_likely_keyboard_sysfs(device_dir: &Path) -> bool {
 
 fn has_key_bit(bits: &str, code: u16) -> bool {
     // sysfs prints the key bitmap as space-separated hexadecimal words, most
-    // significant word first. Concatenating the words gives a big-endian hex
-    // number whose least-significant bit is KEY_RESERVED.
-    let hex: String = bits.split_whitespace().collect();
-    let word = code as usize / 4;
-    let bit = code as usize % 4;
-    if word >= hex.len() {
-        return false;
-    }
-    let index = hex.len() - 1 - word;
-    let Some(nibble) = (hex.as_bytes()[index] as char).to_digit(16) else {
+    // significant word first. Each word is one `unsigned long`, and leading
+    // zero words are omitted, so index words from the right rather than
+    // concatenating variable-width hex strings.
+    let limb_bits = usize::BITS as usize;
+    let word_index = code as usize / limb_bits;
+    let bit_index = code as usize % limb_bits;
+    let Some(word) = bits.split_whitespace().rev().nth(word_index) else {
         return false;
     };
-    nibble & (1u32 << bit) != 0
+    let Ok(value) = usize::from_str_radix(word, 16) else {
+        return false;
+    };
+    value & (1usize << bit_index) != 0
 }
 
 fn is_keyresolve_identity(identity: &SavedKeyboard) -> bool {
@@ -155,11 +162,11 @@ pub fn find_saved(saved: &SavedKeyboard, keyboards: &[Keyboard]) -> Result<Optio
 }
 
 /// Interactive selection always saves before grabbing. An existing selection is
-/// offered as the default when setup is run again. Candidates come from sysfs,
-/// so the picker works even before the user has permission to open event nodes.
+/// offered as the default when setup is run again. Candidates combine sysfs
+/// metadata with devices opened through evdev after permissions are granted.
 pub fn select_and_save(keyboards: &[KeyboardCandidate], config_path: &Path) -> Result<Config> {
     if keyboards.is_empty() {
-        bail!("No keyboards found in /sys/class/input. Connect a keyboard and try again.");
+        bail!("No keyboards found. Connect a keyboard and try again.");
     }
     if !io::stdin().is_terminal() {
         bail!("Device selection needs a terminal. Run 'KeyResolve setup' interactively.");

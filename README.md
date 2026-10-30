@@ -59,9 +59,10 @@ target/release/KeyResolve
 * `/dev/uinput` (read/write, to create the virtual keyboard)
 
 These permissions are required for both foreground runs and the user service.
-The service itself runs as your normal login user, **not** as root. Setup can
-list keyboards from sysfs before you have device access, so you do not need to
-run the picker with sudo.
+The service itself runs as your normal login user, **not** as root. Setup checks
+device permissions **before** it tries to list or grab a keyboard. If access is
+missing, it offers a one-time sudo permission helper, then continues setup as
+your normal user.
 
 ### Recommended: one-time permission helper
 
@@ -71,14 +72,16 @@ Run setup as your normal user:
 ./KeyResolve setup
 ```
 
-If device access is missing, setup offers to install persistent permissions.
-This uses sudo **once** for a small root-only helper that:
+If device access is missing, setup offers to install persistent permissions
+before showing the keyboard picker. This uses sudo **once** for a small root-only
+helper that:
 
 * creates a dedicated `keyresolve` system group and adds your user to it
 * writes `/etc/udev/rules.d/99-keyresolve.rules`
 * writes `/etc/modules-load.d/keyresolve-uinput.conf` and loads `uinput`
 * reloads/triggers udev and, when `setfacl` is available, grants your current
-  session immediate access to the selected keyboard and `/dev/uinput`
+  session immediate access to the current `/dev/input/event*` nodes and
+  `/dev/uinput`
 
 You can also run the permission step by itself:
 
@@ -128,18 +131,21 @@ Run the interactive setup as your normal user, **without sudo**:
 ./KeyResolve setup
 ```
 
-1. Pick your keyboard from the numbered list. The list is read from sysfs, so it
-   works even before device permissions are granted.
-2. The selection is saved immediately to
+1. If device access is missing, accept the one-time permission prompt first.
+   Setup uses sudo only for the permission helper, then continues as your normal
+   user.
+2. Pick your keyboard from the numbered list. Setup checks sysfs metadata and,
+   after permissions are granted, also opens devices through evdev.
+3. The selection is saved immediately to
    `$XDG_CONFIG_HOME/keyresolve/config.toml` (normally
    `~/.config/keyresolve/config.toml`).
-3. If needed, accept the one-time permission prompt. Setup uses sudo only for the
-   permission helper, then continues as your normal user.
 4. Optionally answer **y** to install, enable, and start the systemd user service.
+   Service installation and startup use `systemctl --user`, not sudo.
 
 The next plain `./KeyResolve` launch uses the saved keyboard without asking again.
-The first plain launch also runs setup if no configuration exists: it offers the
-device picker and the optional user-service prompt **before** grabbing the keyboard.
+The first plain launch also runs setup if no configuration exists: it checks
+permissions, offers the device picker, and offers the optional user-service
+prompt **before** grabbing the keyboard.
 Run setup again to change keyboards; Enter keeps the previous selection when it
 is connected.
 

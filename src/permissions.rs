@@ -22,6 +22,9 @@ SUBSYSTEM==\"misc\", KERNEL==\"uinput\", GROUP=\"keyresolve\", MODE=\"0660\", OP
 pub struct AccessProblem {
     pub device: Option<PathBuf>,
     pub uinput: bool,
+    /// No keyboard is accessible to the current user yet. Used before a device
+    /// has been selected, so setup can ask for the permission helper first.
+    pub keyboard: bool,
 }
 
 /// Check the selected keyboard (when known) and uinput using the current user's
@@ -50,15 +53,23 @@ pub fn check(config: Option<&Config>) -> Result<Option<AccessProblem>> {
         None => false,
     };
     let uinput_problem = !can_open(Path::new("/dev/uinput"), true);
+    let keyboard_problem = config.is_none() && !any_keyboard_accessible();
 
-    if device_problem || uinput_problem {
+    if device_problem || uinput_problem || keyboard_problem {
         Ok(Some(AccessProblem {
             device: if device_problem { device } else { None },
             uinput: uinput_problem,
+            keyboard: keyboard_problem,
         }))
     } else {
         Ok(None)
     }
+}
+
+fn any_keyboard_accessible() -> bool {
+    crate::keyboard::enumerate_candidates()
+        .iter()
+        .any(|candidate| can_open(&candidate.path, true))
 }
 
 fn can_open(path: &Path, write: bool) -> bool {
@@ -98,6 +109,9 @@ pub fn ensure_interactive(config: Option<&Config>) -> Result<()> {
     if problem.uinput {
         eprintln!("  Missing read/write access: /dev/uinput");
     }
+    if problem.keyboard {
+        eprintln!("  No keyboard is accessible to this user yet.");
+    }
     print!(
         "Install persistent device permissions now? This uses sudo once, creates the \
          '{GROUP}' group, and adds your user to it. [Y/n]: "
@@ -111,10 +125,11 @@ pub fn ensure_interactive(config: Option<&Config>) -> Result<()> {
     ) {
         install_with_sudo(config)?;
         if let Some(problem) = check(config)? {
-            if problem.device.is_some() || problem.uinput {
+            if problem.device.is_some() || problem.uinput || problem.keyboard {
                 bail!(
                     "Permissions were installed, but this session still cannot access the devices. \
-                     Log out and back in (or reboot), then run 'KeyResolve setup --service' again."
+                     Connect the keyboard, log out and back in (or reboot), then run \
+                     'KeyResolve setup --service' again."
                 );
             }
         }
@@ -210,9 +225,20 @@ pub fn apply(uid: u32, username: &str, device: Option<&Path>) -> Result<()> {
     // Group membership is not retroactively added to existing processes. ACLs
     // let the current setup/session continue immediately when setfacl exists;
     // the udev rule/group provide persistent access after the next login.
-    let mut acl_paths = vec![PathBuf::from("/dev/uinput")];
+    // Grant every current event node, not just a preselected keyboard, because
+    // the first permission prompt happens before the user picks a device.
+    let mut acl_paths = std::collections::BTreeSet::new();
+    acl_paths.insert(PathBuf::from("/dev/uinput"));
+    if let Ok(entries) = fs::read_dir("/dev/input") {
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            if name.to_string_lossy().starts_with("event") {
+                acl_paths.insert(entry.path());
+            }
+        }
+    }
     if let Some(device) = device {
-        acl_paths.push(device.to_path_buf());
+        acl_paths.insert(device.to_path_buf());
     }
     let acl_arg = format!("u:{uid}:rw");
     let mut acl_applied = true;

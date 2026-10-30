@@ -111,6 +111,9 @@ fn run_command() -> Result<()> {
                     if problem.uinput {
                         eprintln!("Missing read/write access: /dev/uinput");
                     }
+                    if problem.keyboard {
+                        eprintln!("No keyboard is accessible to this user yet.");
+                    }
                     bail!("Run 'KeyResolve permissions install' to fix device access.");
                 }
             }
@@ -150,13 +153,18 @@ fn require_config(path: &Path) -> Result<Config> {
 
 fn setup(config_path: &Path, install_service: Option<bool>) -> Result<bool> {
     permissions::require_unprivileged_user()?;
+    // Ask for the one-time privileged permission helper before discovery or
+    // selection. Everything after this point stays as the normal login user.
+    permissions::ensure_interactive(None)?;
+    println!("Continuing setup as your normal user; the user service will not use sudo.");
     let config = keyboard::select_and_save(&keyboard::enumerate_candidates(), config_path)?;
     println!(
         "Virtual keyboard name: {}",
         keyboard::virtual_device_name(&config.keyboard.name)
     );
-    // Fix device access as the normal user before offering either foreground or
-    // service use. The privileged helper only changes udev/group/ACL settings.
+    // Verify the selected device specifically. This is normally already covered
+    // by the pre-selection permission step, but also handles a device connected
+    // or changed after that step.
     permissions::ensure_interactive(Some(&config))?;
     let install = match install_service {
         Some(value) => value,

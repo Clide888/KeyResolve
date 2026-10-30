@@ -30,6 +30,20 @@ pub struct SavedKeyboard {
 }
 
 impl SavedKeyboard {
+    pub fn from_device(path: &Path, device: &Device) -> Self {
+        let id = device.input_id();
+        Self {
+            name: device.name().unwrap_or("Keyboard").to_owned(),
+            last_path: path.to_owned(),
+            bus_type: id.bus_type().0,
+            vendor: id.vendor(),
+            product: id.product(),
+            version: id.version(),
+            physical_path: nonempty(device.physical_path()),
+            unique_name: nonempty(device.unique_name()),
+        }
+    }
+
     pub fn matches(&self, path: &Path, device: &Device) -> bool {
         let id = device.input_id();
         self.matches_identity(
