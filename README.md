@@ -55,41 +55,70 @@ target/release/KeyResolve
 
 `KeyResolve` needs access to:
 
-* `/dev/input/event*` (read **and write**, for the exclusive grab)
-* `/dev/uinput` (write)
+* the selected `/dev/input/eventX` (read **and write**, for the exclusive grab)
+* `/dev/uinput` (read/write, to create the virtual keyboard)
 
 These permissions are required for both foreground runs and the user service.
-Installing the service does not grant device access or change udev rules.
-Membership in the `input` group grants access to keyboard input; only grant it
-to accounts you trust.
+The service itself runs as your normal login user, **not** as root. Setup can
+list keyboards from sysfs before you have device access, so you do not need to
+run the picker with sudo.
 
-### Create a udev rule
+### Recommended: one-time permission helper
 
-Create `/etc/udev/rules.d/99-input.rules` (automatically created when intalled via the AUR):
+Run setup as your normal user:
+
+```bash
+./KeyResolve setup
+```
+
+If device access is missing, setup offers to install persistent permissions.
+This uses sudo **once** for a small root-only helper that:
+
+* creates a dedicated `keyresolve` system group and adds your user to it
+* writes `/etc/udev/rules.d/99-keyresolve.rules`
+* writes `/etc/modules-load.d/keyresolve-uinput.conf` and loads `uinput`
+* reloads/triggers udev and, when `setfacl` is available, grants your current
+  session immediate access to the selected keyboard and `/dev/uinput`
+
+You can also run the permission step by itself:
+
+```bash
+./KeyResolve permissions install
+./KeyResolve permissions check
+```
+
+If the helper says this session still cannot access the devices, **log out and
+back in** (or reboot), then run `./KeyResolve setup --service` again. The new
+group membership must reach your login session and the systemd user manager.
+
+The `keyresolve` group can read/write input event devices and uinput. Only add
+trusted accounts to it.
+
+### Manual permissions
+
+If you prefer not to use the helper, create
+`/etc/udev/rules.d/99-keyresolve.rules`:
 
 ```ini
-KERNEL=="event*", SUBSYSTEM=="input", GROUP="input", MODE="660"
-KERNEL=="uinput", GROUP="input", MODE="660"
+SUBSYSTEM=="input", KERNEL=="event*", GROUP="keyresolve", MODE="0660", TAG+="uaccess"
+SUBSYSTEM=="misc", KERNEL=="uinput", GROUP="keyresolve", MODE="0660", OPTIONS+="static_node=uinput"
 ```
 
-Reload rules:
+Then:
 
 ```bash
+sudo groupadd --system keyresolve
+sudo usermod -aG keyresolve $USER
+echo uinput | sudo tee /etc/modules-load.d/keyresolve-uinput.conf
+sudo modprobe uinput
 sudo udevadm control --reload-rules
-sudo udevadm trigger
+sudo udevadm trigger --subsystem-match=input --action=change
+sudo udevadm trigger /dev/uinput
 ```
 
-### Add your user to the `input` group
-
-```bash
-sudo usermod -aG input $USER
-```
-
-Then **log out or reboot** so the new group membership applies to your login
-session (including the systemd user manager).
-
-If `/dev/uinput` does not exist, load the module with `sudo modprobe uinput`.
-To load it at boot, add `uinput` to `/etc/modules-load.d/uinput.conf`.
+Log out and back in so the new group applies. If you already use the broader
+`input` group and a working udev rule for `/dev/uinput`, that can also work; the
+helper just avoids requiring the broader `input` group.
 
 ## Setup and saved device
 
@@ -99,11 +128,14 @@ Run the interactive setup as your normal user, **without sudo**:
 ./KeyResolve setup
 ```
 
-1. Pick your keyboard from the numbered list.
+1. Pick your keyboard from the numbered list. The list is read from sysfs, so it
+   works even before device permissions are granted.
 2. The selection is saved immediately to
    `$XDG_CONFIG_HOME/keyresolve/config.toml` (normally
    `~/.config/keyresolve/config.toml`).
-3. Optionally answer **y** to install, enable, and start the systemd user service.
+3. If needed, accept the one-time permission prompt. Setup uses sudo only for the
+   permission helper, then continues as your normal user.
+4. Optionally answer **y** to install, enable, and start the systemd user service.
 
 The next plain `./KeyResolve` launch uses the saved keyboard without asking again.
 The first plain launch also runs setup if no configuration exists: it offers the

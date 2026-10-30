@@ -3,6 +3,7 @@ use anyhow::{Context, Result, bail};
 use evdev::{AttributeSet, BusType, Device, EventType, InputEvent, KeyCode, uinput::VirtualDevice};
 use nix::poll::{PollFd, PollFlags, poll};
 use std::{
+    fs,
     io::{self, IsTerminal, Write},
     os::fd::{AsRawFd, BorrowedFd},
     path::{Path, PathBuf},
@@ -14,6 +15,99 @@ use std::{
 
 pub type Keyboard = (PathBuf, Device);
 const VIRTUAL_SUFFIX: &str = " (KeyResolve)";
+
+/// A keyboard discovered from sysfs. Unlike opening /dev/input/eventX, this does
+/// not require device permissions, so setup can list keyboards before the
+/// one-time udev/group permission helper has run.
+pub struct KeyboardCandidate {
+    pub path: PathBuf,
+    pub identity: SavedKeyboard,
+}
+
+pub fn enumerate_candidates() -> Vec<KeyboardCandidate> {
+    let mut candidates = Vec::new();
+    let Ok(entries) = fs::read_dir("/sys/class/input") else {
+        return candidates;
+    };
+    for entry in entries.flatten() {
+        let filename = entry.file_name();
+        let Some(name) = filename.to_str() else {
+            continue;
+        };
+        if !name.starts_with("event") {
+            continue;
+        }
+        let device_dir = entry.path().join("device");
+        let Some(identity) = read_identity(&device_dir, Path::new("/dev/input").join(name)) else {
+            continue;
+        };
+        if !is_likely_keyboard_sysfs(&device_dir) || is_keyresolve_identity(&identity) {
+            continue;
+        }
+        candidates.push(KeyboardCandidate {
+            path: Path::new("/dev/input").join(name),
+            identity,
+        });
+    }
+    candidates.sort_by(|a, b| a.path.cmp(&b.path));
+    candidates
+}
+
+fn read_string(path: &Path) -> Option<String> {
+    fs::read_to_string(path)
+        .ok()
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty())
+}
+
+fn read_hex(path: &Path) -> Option<u16> {
+    u16::from_str_radix(&read_string(path)?, 16).ok()
+}
+
+fn read_identity(device_dir: &Path, path: PathBuf) -> Option<SavedKeyboard> {
+    let id = device_dir.join("id");
+    Some(SavedKeyboard {
+        name: read_string(&device_dir.join("name")).unwrap_or_else(|| "Keyboard".into()),
+        last_path: path,
+        bus_type: read_hex(&id.join("bus"))?,
+        vendor: read_hex(&id.join("vendor"))?,
+        product: read_hex(&id.join("product"))?,
+        version: read_hex(&id.join("version"))?,
+        physical_path: read_string(&device_dir.join("phys")),
+        unique_name: read_string(&device_dir.join("uniq")),
+    })
+}
+
+fn is_likely_keyboard_sysfs(device_dir: &Path) -> bool {
+    let Some(bits) = read_string(&device_dir.join("capabilities/key")) else {
+        return false;
+    };
+    has_key_bit(&bits, KeyCode::KEY_A.code())
+        && has_key_bit(&bits, KeyCode::KEY_Z.code())
+        && has_key_bit(&bits, KeyCode::KEY_SPACE.code())
+}
+
+fn has_key_bit(bits: &str, code: u16) -> bool {
+    // sysfs prints the key bitmap as space-separated hexadecimal words, most
+    // significant word first. Concatenating the words gives a big-endian hex
+    // number whose least-significant bit is KEY_RESERVED.
+    let hex: String = bits.split_whitespace().collect();
+    let word = code as usize / 4;
+    let bit = code as usize % 4;
+    if word >= hex.len() {
+        return false;
+    }
+    let index = hex.len() - 1 - word;
+    let Some(nibble) = (hex.as_bytes()[index] as char).to_digit(16) else {
+        return false;
+    };
+    nibble & (1u32 << bit) != 0
+}
+
+fn is_keyresolve_identity(identity: &SavedKeyboard) -> bool {
+    identity.bus_type == BusType::BUS_VIRTUAL.0
+        && (identity.name.ends_with(VIRTUAL_SUFFIX) || identity.name == "snap-tap-virtual")
+}
 
 pub fn enumerate_keyboards() -> Vec<Keyboard> {
     let mut keyboards: Vec<_> = evdev::enumerate()
@@ -61,10 +155,11 @@ pub fn find_saved(saved: &SavedKeyboard, keyboards: &[Keyboard]) -> Result<Optio
 }
 
 /// Interactive selection always saves before grabbing. An existing selection is
-/// offered as the default when setup is run again.
-pub fn select_and_save(keyboards: &[Keyboard], config_path: &Path) -> Result<Config> {
+/// offered as the default when setup is run again. Candidates come from sysfs,
+/// so the picker works even before the user has permission to open event nodes.
+pub fn select_and_save(keyboards: &[KeyboardCandidate], config_path: &Path) -> Result<Config> {
     if keyboards.is_empty() {
-        bail!("No accessible keyboards found. Check the input permissions in the README.");
+        bail!("No keyboards found in /sys/class/input. Connect a keyboard and try again.");
     }
     if !io::stdin().is_terminal() {
         bail!("Device selection needs a terminal. Run 'KeyResolve setup' interactively.");
@@ -76,14 +171,16 @@ pub fn select_and_save(keyboards: &[Keyboard], config_path: &Path) -> Result<Con
             None
         }
     };
-    let default = previous
-        .as_ref()
-        .and_then(|config| find_saved(&config.keyboard, keyboards).ok().flatten());
-    for (index, (path, device)) in keyboards.iter().enumerate() {
+    let default = previous.as_ref().and_then(|config| {
+        keyboards
+            .iter()
+            .position(|candidate| config.keyboard.matches_candidate(candidate))
+    });
+    for (index, candidate) in keyboards.iter().enumerate() {
         println!(
             "{index}: {} ({})",
-            device.name().unwrap_or("Unknown keyboard"),
-            path.display()
+            candidate.identity.name,
+            candidate.path.display()
         );
     }
 
@@ -109,8 +206,8 @@ pub fn select_and_save(keyboards: &[Keyboard], config_path: &Path) -> Result<Con
         println!("Enter a number from 0 to {}.", keyboards.len() - 1);
     };
 
-    let (path, device) = &keyboards[selected];
-    let config = Config::new(SavedKeyboard::from_device(path, device));
+    let candidate = &keyboards[selected];
+    let config = Config::new(candidate.identity.clone());
     config.save(config_path)?;
     println!("Saved keyboard: {}", config.keyboard.name);
     println!("Configuration: {}", config_path.display());

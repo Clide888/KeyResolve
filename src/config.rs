@@ -30,33 +30,56 @@ pub struct SavedKeyboard {
 }
 
 impl SavedKeyboard {
-    pub fn from_device(path: &Path, device: &Device) -> Self {
-        let id = device.input_id();
-        Self {
-            name: device.name().unwrap_or("Keyboard").to_owned(),
-            last_path: path.to_owned(),
-            bus_type: id.bus_type().0,
-            vendor: id.vendor(),
-            product: id.product(),
-            version: id.version(),
-            physical_path: nonempty(device.physical_path()),
-            unique_name: nonempty(device.unique_name()),
-        }
-    }
-
     pub fn matches(&self, path: &Path, device: &Device) -> bool {
         let id = device.input_id();
-        if self.name != device.name().unwrap_or("Keyboard")
-            || self.bus_type != id.bus_type().0
-            || self.vendor != id.vendor()
-            || self.product != id.product()
-            || self.version != id.version()
+        self.matches_identity(
+            path,
+            device.name().unwrap_or("Keyboard"),
+            id.bus_type().0,
+            id.vendor(),
+            id.product(),
+            id.version(),
+            device.physical_path(),
+            device.unique_name(),
+        )
+    }
+
+    pub fn matches_candidate(&self, candidate: &crate::keyboard::KeyboardCandidate) -> bool {
+        let identity = &candidate.identity;
+        self.matches_identity(
+            &candidate.path,
+            &identity.name,
+            identity.bus_type,
+            identity.vendor,
+            identity.product,
+            identity.version,
+            identity.physical_path.as_deref(),
+            identity.unique_name.as_deref(),
+        )
+    }
+
+    fn matches_identity(
+        &self,
+        path: &Path,
+        name: &str,
+        bus_type: u16,
+        vendor: u16,
+        product: u16,
+        version: u16,
+        physical_path: Option<&str>,
+        unique_name: Option<&str>,
+    ) -> bool {
+        if self.name != name
+            || self.bus_type != bus_type
+            || self.vendor != vendor
+            || self.product != product
+            || self.version != version
         {
             return false;
         }
 
-        let physical_path = nonempty(device.physical_path());
-        let unique_name = nonempty(device.unique_name());
+        let physical_path = nonempty(physical_path);
+        let unique_name = nonempty(unique_name);
 
         // A serial/unique ID can follow a keyboard to another USB port. Otherwise
         // its physical connection identifies it. Never fall back to a different

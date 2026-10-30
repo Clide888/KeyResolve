@@ -1,12 +1,12 @@
 mod config;
 mod keyboard;
+mod permissions;
 mod service;
 
 use anyhow::{Context, Result, bail};
 use config::Config;
 use keyboard::SessionExit;
 use std::{
-    fs::OpenOptions,
     io::{self, Write},
     path::Path,
     sync::{
@@ -28,6 +28,8 @@ Usage:
   KeyResolve run [--config PATH] Use the saved keyboard without interactive prompts
   KeyResolve service install     Install, enable, and start the systemd user service
   KeyResolve service uninstall   Stop/disable/remove the service, keeping configuration
+  KeyResolve permissions install Grant this user device access (uses sudo once)
+  KeyResolve permissions check   Check device access as the current user
   KeyResolve --help              Show this help
   KeyResolve --version           Show the version
 
@@ -55,7 +57,10 @@ fn run_command() -> Result<()> {
 
     match arguments.as_slice() {
         [] => match Config::load(&config_path)? {
-            Some(config) => run(config, &config_path),
+            Some(config) => {
+                permissions::ensure_interactive(Some(&config))?;
+                run(config, &config_path)
+            }
             None => {
                 // First run is setup: offer the user service before grabbing the
                 // keyboard, so the interactive prompt is not hidden behind the
@@ -81,11 +86,52 @@ fn run_command() -> Result<()> {
         ["setup", "--no-service"] => setup(&config_path, Some(false)).map(|_| ()),
         ["setup"] => setup(&config_path, None).map(|_| ()),
         ["service", "install"] => {
+            permissions::require_unprivileged_user()?;
             let config = require_config(&config_path)?;
-            check_permissions(&config)?;
+            permissions::ensure_interactive(Some(&config))?;
             service::install(&service::ServicePaths::from_xdg()?, &config_path)
         }
         ["service", "uninstall"] => service::uninstall(&service::ServicePaths::from_xdg()?),
+        ["permissions", "install"] => {
+            permissions::require_unprivileged_user()?;
+            let config = Config::load(&config_path)?;
+            permissions::install_with_sudo(config.as_ref())
+        }
+        ["permissions", "check"] => {
+            let config = Config::load(&config_path)?;
+            match permissions::check(config.as_ref())? {
+                None => {
+                    println!("Device permissions look OK for this user.");
+                    Ok(())
+                }
+                Some(problem) => {
+                    if let Some(path) = problem.device {
+                        eprintln!("Missing read/write access: {}", path.display());
+                    }
+                    if problem.uinput {
+                        eprintln!("Missing read/write access: /dev/uinput");
+                    }
+                    bail!("Run 'KeyResolve permissions install' to fix device access.");
+                }
+            }
+        }
+        ["permissions", "apply", "--uid", uid, "--user", username] => {
+            permissions::apply(uid.parse().context("Invalid --uid")?, username, None)
+        }
+        [
+            "permissions",
+            "apply",
+            "--uid",
+            uid,
+            "--user",
+            username,
+            "--device",
+            device,
+        ] => permissions::apply(
+            uid.parse().context("Invalid --uid")?,
+            username,
+            Some(Path::new(device)),
+        ),
         ["--help" | "-h" | "help"] => {
             print!("{HELP}");
             Ok(())
@@ -103,17 +149,20 @@ fn require_config(path: &Path) -> Result<Config> {
 }
 
 fn setup(config_path: &Path, install_service: Option<bool>) -> Result<bool> {
-    let config = keyboard::select_and_save(&keyboard::enumerate_keyboards(), config_path)?;
+    permissions::require_unprivileged_user()?;
+    let config = keyboard::select_and_save(&keyboard::enumerate_candidates(), config_path)?;
     println!(
         "Virtual keyboard name: {}",
         keyboard::virtual_device_name(&config.keyboard.name)
     );
+    // Fix device access as the normal user before offering either foreground or
+    // service use. The privileged helper only changes udev/group/ACL settings.
+    permissions::ensure_interactive(Some(&config))?;
     let install = match install_service {
         Some(value) => value,
         None => ask_yes_no("Install and start KeyResolve as a service for your user? [y/N]: ")?,
     };
     if install {
-        check_permissions(&config)?;
         service::install(&service::ServicePaths::from_xdg()?, config_path)?;
     } else {
         println!("Run 'KeyResolve' to use the saved keyboard, or 'KeyResolve setup' to change it.");
@@ -132,27 +181,19 @@ fn ask_yes_no(question: &str) -> Result<bool> {
     ))
 }
 
-fn check_permissions(config: &Config) -> Result<()> {
-    let keyboards = keyboard::enumerate_keyboards();
-    let index = keyboard::find_saved(&config.keyboard, &keyboards)?
-        .context("The saved keyboard is not connected. Reconnect it and try again.")?;
-    OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open(&keyboards[index].0)
-        .with_context(|| {
-            format!(
-                "Cannot open {} for reading and writing. Follow the input/udev permissions section in README.md.",
-                keyboards[index].0.display()
-            )
-        })?;
-    OpenOptions::new().write(true).open("/dev/uinput").context(
-        "Cannot write to /dev/uinput. Follow the input/udev permissions section in README.md.",
-    )?;
-    Ok(())
-}
-
 fn run(mut config: Config, config_path: &Path) -> Result<()> {
+    if let Some(problem) = permissions::check(Some(&config))? {
+        if let Some(path) = problem.device {
+            eprintln!("Missing read/write access: {}", path.display());
+        }
+        if problem.uinput {
+            eprintln!("Missing read/write access: /dev/uinput");
+        }
+        bail!(
+            "Device permissions are missing. Run 'KeyResolve permissions install' as this user, \
+             then log out/in if prompted."
+        );
+    }
     let running = install_signal_handler()?;
     let mut waiting = false;
     while running.load(Ordering::SeqCst) {
