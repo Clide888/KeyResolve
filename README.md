@@ -106,7 +106,8 @@ Run the interactive setup as your normal user, **without sudo**:
 3. Optionally answer **y** to install, enable, and start the systemd user service.
 
 The next plain `./KeyResolve` launch uses the saved keyboard without asking again.
-The first plain launch also offers the device picker if no configuration exists.
+The first plain launch also runs setup if no configuration exists: it offers the
+device picker and the optional user-service prompt **before** grabbing the keyboard.
 Run setup again to change keyboards; Enter keeps the previous selection when it
 is connected.
 
@@ -197,6 +198,12 @@ Once running:
 * When the last pressed key is released, the previous still-held key (if any) is restored
 
 Exit cleanly with **Ctrl+C**.
+
+The `Grabbed … — KeyResolve is running.` message is the normal foreground state,
+not a stuck setup step. The process stays there forwarding keys until you stop it.
+If you want it managed in the background instead, stop the foreground process and
+run `./KeyResolve setup` (or `./KeyResolve service install` if a keyboard is already
+saved).
 
 ## Safety notes
 

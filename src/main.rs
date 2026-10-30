@@ -21,7 +21,7 @@ const HELP: &str = "\
 KeyResolve — last-pressed-wins keyboard input for Linux
 
 Usage:
-  KeyResolve                     Use the saved keyboard (select it on first run)
+  KeyResolve                     Use the saved keyboard (first run offers setup)
   KeyResolve setup               Select/save a keyboard; optionally install a user service
   KeyResolve setup --service     Select/save a keyboard and install the user service
   KeyResolve setup --no-service  Select/save a keyboard without the service prompt
@@ -52,13 +52,21 @@ fn run_command() -> Result<()> {
     let config_path = config::default_path()?;
 
     match arguments.as_slice() {
-        [] => {
-            let config = match Config::load(&config_path)? {
-                Some(config) => config,
-                None => keyboard::select_and_save(&keyboard::enumerate_keyboards(), &config_path)?,
-            };
-            run(config, &config_path)
-        }
+        [] => match Config::load(&config_path)? {
+            Some(config) => run(config, &config_path),
+            None => {
+                // First run is setup: offer the user service before grabbing the
+                // keyboard, so the interactive prompt is not hidden behind the
+                // long-running foreground event loop.
+                if setup(&config_path, None)? {
+                    Ok(())
+                } else {
+                    let config = require_config(&config_path)?;
+                    println!("Starting in the foreground. Press Ctrl+C to stop.");
+                    run(config, &config_path)
+                }
+            }
+        },
         ["run"] | ["run", "--config", _] => {
             let path = match arguments.as_slice() {
                 ["run", "--config", path] => Path::new(path),
@@ -67,9 +75,9 @@ fn run_command() -> Result<()> {
             let config = require_config(path)?;
             run(config, path)
         }
-        ["setup", "--service"] => setup(&config_path, Some(true)),
-        ["setup", "--no-service"] => setup(&config_path, Some(false)),
-        ["setup"] => setup(&config_path, None),
+        ["setup", "--service"] => setup(&config_path, Some(true)).map(|_| ()),
+        ["setup", "--no-service"] => setup(&config_path, Some(false)).map(|_| ()),
+        ["setup"] => setup(&config_path, None).map(|_| ()),
         ["service", "install"] => {
             let config = require_config(&config_path)?;
             check_permissions(&config)?;
@@ -92,7 +100,7 @@ fn require_config(path: &Path) -> Result<Config> {
     Config::load(path)?.context("No saved keyboard. Run 'KeyResolve setup' first.")
 }
 
-fn setup(config_path: &Path, install_service: Option<bool>) -> Result<()> {
+fn setup(config_path: &Path, install_service: Option<bool>) -> Result<bool> {
     let config = keyboard::select_and_save(&keyboard::enumerate_keyboards(), config_path)?;
     println!(
         "Virtual keyboard name: {}",
@@ -108,7 +116,7 @@ fn setup(config_path: &Path, install_service: Option<bool>) -> Result<()> {
     } else {
         println!("Run 'KeyResolve' to use the saved keyboard, or 'KeyResolve setup' to change it.");
     }
-    Ok(())
+    Ok(install)
 }
 
 fn ask_yes_no(question: &str) -> Result<bool> {

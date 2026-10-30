@@ -210,6 +210,7 @@ pub fn run_session(
             path.display()
         )
     })?;
+    println!("Grabbed {} — KeyResolve is running.", path.display());
 
     let result = run_event_loop(device, &mut vdev, running);
     // The evdev Device also ungrabs on drop, including on an error path.
