@@ -10,7 +10,6 @@ use std::{
         Arc,
         atomic::{AtomicBool, Ordering},
     },
-    time::Duration,
 };
 
 pub type Keyboard = (PathBuf, Device);

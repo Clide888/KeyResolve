@@ -46,9 +46,11 @@ fn main() -> Result<()> {
 }
 
 fn run_command() -> Result<()> {
-    let arguments: Vec<_> = std::env::args_os().skip(1).collect();
-    let arguments: Vec<_> = arguments.iter().map(|arg| arg.to_string_lossy()).collect();
-    let arguments: Vec<_> = arguments.iter().map(String::as_ref).collect();
+    let arguments: Vec<_> = std::env::args_os()
+        .skip(1)
+        .map(|arg| arg.to_string_lossy().into_owned())
+        .collect();
+    let arguments: Vec<_> = arguments.iter().map(String::as_str).collect();
     let config_path = config::default_path()?;
 
     match arguments.as_slice() {
