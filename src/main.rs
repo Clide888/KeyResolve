@@ -1,226 +1,252 @@
-use anyhow::{Context, Result};
-use evdev::{Device, EventType, InputEvent, KeyCode, uinput::VirtualDevice};
-use nix::poll::{PollFd, PollFlags, poll};
+mod config;
+mod keyboard;
+mod service;
+
+use anyhow::{Context, Result, bail};
+use config::Config;
+use keyboard::SessionExit;
 use std::{
-    io::Write,
-    os::fd::{AsRawFd, BorrowedFd},
-    path::PathBuf,
+    fs::OpenOptions,
+    io::{self, Write},
+    path::Path,
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
     },
+    thread,
     time::Duration,
 };
 
+const HELP: &str = "\
+KeyResolve — last-pressed-wins keyboard input for Linux
+
+Usage:
+  KeyResolve                     Use the saved keyboard (select it on first run)
+  KeyResolve setup               Select/save a keyboard; optionally install a user service
+  KeyResolve setup --service     Select/save a keyboard and install the user service
+  KeyResolve setup --no-service  Select/save a keyboard without the service prompt
+  KeyResolve run [--config PATH] Use the saved keyboard without interactive prompts
+  KeyResolve service install     Install, enable, and start the systemd user service
+  KeyResolve service uninstall   Stop/disable/remove the service, keeping configuration
+  KeyResolve --help              Show this help
+  KeyResolve --version           Show the version
+
+The virtual keyboard is named '<selected keyboard> (KeyResolve)'.
+Configuration: $XDG_CONFIG_HOME/keyresolve/config.toml
+              (default: ~/.config/keyresolve/config.toml)
+Input and uinput permissions are required; see README.md.
+";
+
 fn main() -> Result<()> {
-    let keyboards = enumerate_keyboards()?;
-    let selected = select_keyboard(&keyboards)?;
-
-    println!("Waiting 3 seconds. Do not press any keys.");
-    std::thread::sleep(Duration::from_secs(3));
-
-    let (path, _) = &keyboards[selected];
-    let mut device = Device::open(path).context("Failed to reopen selected device")?;
-
-    println!("Grabbing {}", path.display());
-    device.grab().context("Failed to grab device")?;
-
-    let mut vdev = create_virtual_keyboard(&device)?;
-    let running = install_ctrlc_handler()?;
-
-    run_event_loop(&mut device, &mut vdev, running)?;
-
-    println!("Releasing keyboard");
-    device.ungrab()?;
-
+    if let Err(error) = run_command() {
+        eprintln!("Error: {error:#}");
+        std::process::exit(1);
+    }
     Ok(())
 }
 
-fn is_likely_keyboard(device: &Device) -> bool {
-    device
-        .supported_keys()
-        .map(|keys| {
-            keys.contains(KeyCode::KEY_A)
-                && keys.contains(KeyCode::KEY_Z)
-                && keys.contains(KeyCode::KEY_SPACE)
-        })
-        .unwrap_or(false)
-}
+fn run_command() -> Result<()> {
+    let arguments: Vec<_> = std::env::args_os().skip(1).collect();
+    let arguments: Vec<_> = arguments.iter().map(|arg| arg.to_string_lossy()).collect();
+    let arguments: Vec<_> = arguments.iter().map(String::as_ref).collect();
+    let config_path = config::default_path()?;
 
-fn emit_key(vdev: &mut VirtualDevice, key: KeyCode, value: i32) {
-    let event = InputEvent::new(EventType::KEY.0, key.code(), value);
-    let _ = vdev.emit(&[event]);
-}
-
-fn handle_axis_pair(
-    vdev: &mut VirtualDevice,
-    pressed: bool,
-    this_down: &mut bool,
-    other_down: bool,
-    this_key: KeyCode,
-    other_key: KeyCode,
-) {
-    *this_down = pressed;
-
-    emit_key(vdev, this_key, pressed as i32);
-
-    if other_down {
-        emit_key(vdev, other_key, (!pressed) as i32);
-    }
-}
-
-fn enumerate_keyboards() -> Result<Vec<(PathBuf, String)>> {
-    let mut keyboards = Vec::new();
-
-    for entry in evdev::enumerate() {
-        let device =
-            Device::open(&entry.0).with_context(|| format!("Failed to open {:?}", entry.0))?;
-
-        if is_likely_keyboard(&device) {
-            let name = device.name().unwrap_or("Unknown keyboard").to_string();
-            keyboards.push((entry.0, name));
+    match arguments.as_slice() {
+        [] => {
+            let config = match Config::load(&config_path)? {
+                Some(config) => config,
+                None => keyboard::select_and_save(&keyboard::enumerate_keyboards(), &config_path)?,
+            };
+            run(config, &config_path)
         }
+        ["run"] | ["run", "--config", _] => {
+            let path = match arguments.as_slice() {
+                ["run", "--config", path] => Path::new(path),
+                _ => config_path.as_path(),
+            };
+            let config = require_config(path)?;
+            run(config, path)
+        }
+        ["setup", "--service"] => setup(&config_path, Some(true)),
+        ["setup", "--no-service"] => setup(&config_path, Some(false)),
+        ["setup"] => setup(&config_path, None),
+        ["service", "install"] => {
+            let config = require_config(&config_path)?;
+            check_permissions(&config)?;
+            service::install(&service::ServicePaths::from_xdg()?, &config_path)
+        }
+        ["service", "uninstall"] => service::uninstall(&service::ServicePaths::from_xdg()?),
+        ["--help" | "-h" | "help"] => {
+            print!("{HELP}");
+            Ok(())
+        }
+        ["--version" | "-V"] => {
+            println!("KeyResolve {}", env!("CARGO_PKG_VERSION"));
+            Ok(())
+        }
+        _ => bail!("Unknown arguments. Run 'KeyResolve --help' for usage."),
     }
-
-    if keyboards.is_empty() {
-        anyhow::bail!("No keyboards found. Do you have required permissions?");
-    }
-
-    Ok(keyboards)
 }
 
-fn select_keyboard(keyboards: &[(PathBuf, String)]) -> Result<usize> {
-    for (idx, (path, name)) in keyboards.iter().enumerate() {
-        println!("{idx}: {name} ({})", path.display());
+fn require_config(path: &Path) -> Result<Config> {
+    Config::load(path)?.context("No saved keyboard. Run 'KeyResolve setup' first.")
+}
+
+fn setup(config_path: &Path, install_service: Option<bool>) -> Result<()> {
+    let config = keyboard::select_and_save(&keyboard::enumerate_keyboards(), config_path)?;
+    println!(
+        "Virtual keyboard name: {}",
+        keyboard::virtual_device_name(&config.keyboard.name)
+    );
+    let install = match install_service {
+        Some(value) => value,
+        None => ask_yes_no("Install and start KeyResolve as a service for your user? [y/N]: ")?,
+    };
+    if install {
+        check_permissions(&config)?;
+        service::install(&service::ServicePaths::from_xdg()?, config_path)?;
+    } else {
+        println!("Run 'KeyResolve' to use the saved keyboard, or 'KeyResolve setup' to change it.");
     }
-
-    print!("Select keyboard: ");
-    std::io::stdout().flush()?;
-
-    let mut input = String::new();
-    std::io::stdin().read_line(&mut input)?;
-
-    Ok(input.trim().parse()?)
+    Ok(())
 }
 
-fn create_virtual_keyboard(device: &Device) -> Result<VirtualDevice> {
-    let keys = device
-        .supported_keys()
-        .context("Failed to query supported keys")?;
-
-    VirtualDevice::builder()?
-        .name("snap-tap-virtual")
-        .with_keys(keys)?
-        .build()
-        .context("Failed to create virtual keyboard")
+fn ask_yes_no(question: &str) -> Result<bool> {
+    print!("{question}");
+    io::stdout().flush()?;
+    let mut answer = String::new();
+    io::stdin().read_line(&mut answer)?;
+    Ok(matches!(
+        answer.trim().to_ascii_lowercase().as_str(),
+        "y" | "yes"
+    ))
 }
 
-fn install_ctrlc_handler() -> Result<Arc<AtomicBool>> {
+fn check_permissions(config: &Config) -> Result<()> {
+    let keyboards = keyboard::enumerate_keyboards();
+    let index = keyboard::find_saved(&config.keyboard, &keyboards)?
+        .context("The saved keyboard is not connected. Reconnect it and try again.")?;
+    OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&keyboards[index].0)
+        .with_context(|| {
+            format!(
+                "Cannot open {} for reading and writing. Follow the input/udev permissions section in README.md.",
+                keyboards[index].0.display()
+            )
+        })?;
+    OpenOptions::new().write(true).open("/dev/uinput").context(
+        "Cannot write to /dev/uinput. Follow the input/udev permissions section in README.md.",
+    )?;
+    Ok(())
+}
+
+fn run(mut config: Config, config_path: &Path) -> Result<()> {
+    let running = install_signal_handler()?;
+    let mut waiting = false;
+    while running.load(Ordering::SeqCst) {
+        let keyboards = keyboard::enumerate_keyboards();
+        let Some(index) = keyboard::find_saved(&config.keyboard, &keyboards)? else {
+            if !waiting {
+                println!(
+                    "Waiting for saved keyboard '{}' (or its reconnect). Ctrl+C to stop.",
+                    config.keyboard.name
+                );
+                waiting = true;
+            }
+            sleep_interruptibly(&running, Duration::from_secs(2));
+            continue;
+        };
+        waiting = false;
+        let (path, mut device) = keyboards.into_iter().nth(index).expect("matched index");
+        if config.keyboard.last_path != path {
+            config.keyboard.last_path = path.clone();
+            // Event numbers can change. Keep the hint current, but do not stop
+            // working if the existing configuration is temporarily read-only.
+            if let Err(error) = config.save(config_path) {
+                eprintln!("Warning: could not update the saved event path: {error:#}");
+            }
+        }
+        match keyboard::run_session(&path, &mut device, &running) {
+            Ok(SessionExit::Stopped) => break,
+            Ok(SessionExit::Disconnected) => {
+                println!("Keyboard disconnected; waiting for the same keyboard to return.");
+            }
+            Err(error) => {
+                if !running.load(Ordering::SeqCst) {
+                    break;
+                }
+                if is_disconnection(&error) {
+                    println!("Keyboard disconnected; waiting for the same keyboard to return.");
+                } else {
+                    return Err(error);
+                }
+            }
+        }
+        sleep_interruptibly(&running, Duration::from_secs(1));
+    }
+    Ok(())
+}
+
+fn is_disconnection(error: &anyhow::Error) -> bool {
+    error.downcast_ref::<io::Error>().is_some_and(|error| {
+        error.kind() == io::ErrorKind::NotConnected
+            || error.raw_os_error() == Some(nix::errno::Errno::ENODEV as i32)
+    })
+}
+
+fn sleep_interruptibly(running: &AtomicBool, duration: Duration) {
+    let mut remaining = duration;
+    let step = Duration::from_millis(50);
+    while !remaining.is_zero() && running.load(Ordering::SeqCst) {
+        let delay = remaining.min(step);
+        thread::sleep(delay);
+        remaining = remaining.saturating_sub(delay);
+    }
+}
+
+fn install_signal_handler() -> Result<Arc<AtomicBool>> {
     let running = Arc::new(AtomicBool::new(true));
     let flag = running.clone();
-
-    ctrlc::set_handler(move || {
-        flag.store(false, Ordering::SeqCst);
-    })?;
-
+    // ctrlc handles SIGTERM as well as Ctrl+C on Unix, allowing systemctl stop
+    // to take the same cleanup path as an interactive shutdown.
+    ctrlc::set_handler(move || flag.store(false, Ordering::SeqCst))
+        .context("Failed to install shutdown signal handler")?;
     Ok(running)
 }
 
-fn run_event_loop(
-    device: &mut Device,
-    vdev: &mut VirtualDevice,
-    running: Arc<AtomicBool>,
-) -> Result<()> {
-    let mut a_down = false;
-    let mut d_down = false;
-    let mut w_down = false;
-    let mut s_down = false;
+#[cfg(test)]
+mod test_support {
+    use std::{
+        fs,
+        path::{Path, PathBuf},
+        sync::atomic::{AtomicU64, Ordering},
+    };
 
-    let raw_fd = device.as_raw_fd();
+    static NEXT_ID: AtomicU64 = AtomicU64::new(0);
 
-    let borrowed_fd = unsafe { BorrowedFd::borrow_raw(raw_fd) };
-    let mut poll_fds = [PollFd::new(borrowed_fd, PollFlags::POLLIN)];
+    pub struct TestDirectory(PathBuf);
 
-    while running.load(Ordering::SeqCst) {
-        let ready = match poll(&mut poll_fds, 50u16) {
-            Ok(n) => n,
-            Err(nix::errno::Errno::EINTR) => continue,
-            Err(e) => return Err(e.into()),
-        };
-
-        if ready == 0 {
-            continue;
+    impl TestDirectory {
+        pub fn new() -> Self {
+            let path = std::env::temp_dir().join(format!(
+                "keyresolve-test-{}-{}",
+                std::process::id(),
+                NEXT_ID.fetch_add(1, Ordering::Relaxed)
+            ));
+            fs::create_dir(&path).unwrap();
+            Self(path)
         }
 
-        if !poll_fds[0]
-            .revents()
-            .map(|e| e.contains(PollFlags::POLLIN))
-            .unwrap_or(false)
-        {
-            continue;
-        }
-
-        for event in device.fetch_events()? {
-            if event.event_type() != EventType::KEY {
-                let _ = vdev.emit(&[event]);
-                continue;
-            }
-
-            let event_value = event.value();
-
-            if event_value == 2 {
-                continue;
-            }
-
-            let pressed = event.value() == 1;
-
-            match event.code() {
-                code if code == KeyCode::KEY_A.code() => {
-                    handle_axis_pair(
-                        vdev,
-                        pressed,
-                        &mut a_down,
-                        d_down,
-                        KeyCode::KEY_A,
-                        KeyCode::KEY_D,
-                    );
-                }
-                code if code == KeyCode::KEY_D.code() => {
-                    handle_axis_pair(
-                        vdev,
-                        pressed,
-                        &mut d_down,
-                        a_down,
-                        KeyCode::KEY_D,
-                        KeyCode::KEY_A,
-                    );
-                }
-                code if code == KeyCode::KEY_W.code() => {
-                    handle_axis_pair(
-                        vdev,
-                        pressed,
-                        &mut w_down,
-                        s_down,
-                        KeyCode::KEY_W,
-                        KeyCode::KEY_S,
-                    );
-                }
-                code if code == KeyCode::KEY_S.code() => {
-                    handle_axis_pair(
-                        vdev,
-                        pressed,
-                        &mut s_down,
-                        w_down,
-                        KeyCode::KEY_S,
-                        KeyCode::KEY_W,
-                    );
-                }
-                _ => {
-                    let _ = vdev.emit(&[event]);
-                }
-            }
+        pub fn path(&self) -> &Path {
+            &self.0
         }
     }
 
-    Ok(())
+    impl Drop for TestDirectory {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
 }

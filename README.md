@@ -16,7 +16,10 @@ This approach works reliably on **Wayland**, **X11**, and in **games that use ra
 * ✅ Written in **Rust**
 * ✅ No kernel modules
 * ✅ No compositor plugins
-* ✅ Clean Ctrl-C shutdown (no stuck keys)
+* ✅ Clean Ctrl-C / SIGTERM shutdown (releases held keys)
+* ✅ Remembers the selected keyboard across launches and reconnects
+* ✅ Names the virtual keyboard after the selected device
+* ✅ Optional systemd **user** service, started at login
 
 ## Installation
 
@@ -52,8 +55,13 @@ target/release/KeyResolve
 
 `KeyResolve` needs access to:
 
-* `/dev/input/event*` (read)
+* `/dev/input/event*` (read **and write**, for the exclusive grab)
 * `/dev/uinput` (write)
+
+These permissions are required for both foreground runs and the user service.
+Installing the service does not grant device access or change udev rules.
+Membership in the `input` group grants access to keyboard input; only grant it
+to accounts you trust.
 
 ### Create a udev rule
 
@@ -77,17 +85,108 @@ sudo udevadm trigger
 sudo usermod -aG input $USER
 ```
 
-Then **log out or reboot**.
+Then **log out or reboot** so the new group membership applies to your login
+session (including the systemd user manager).
+
+If `/dev/uinput` does not exist, load the module with `sudo modprobe uinput`.
+To load it at boot, add `uinput` to `/etc/modules-load.d/uinput.conf`.
+
+## Setup and saved device
+
+Run the interactive setup as your normal user, **without sudo**:
+
+```bash
+./KeyResolve setup
+```
+
+1. Pick your keyboard from the numbered list.
+2. The selection is saved immediately to
+   `$XDG_CONFIG_HOME/keyresolve/config.toml` (normally
+   `~/.config/keyresolve/config.toml`).
+3. Optionally answer **y** to install, enable, and start the systemd user service.
+
+The next plain `./KeyResolve` launch uses the saved keyboard without asking again.
+The first plain launch also offers the device picker if no configuration exists.
+Run setup again to change keyboards; Enter keeps the previous selection when it
+is connected.
+
+The saved hardware identity (name, bus/vendor/product/version, and physical path
+or unique ID) is used to find the keyboard again after `/dev/input/eventX` changes.
+If it is unplugged, KeyResolve waits for that keyboard rather than grabbing a
+different one. If multiple connected devices have the same saved identity,
+KeyResolve reports the ambiguity instead of grabbing an arbitrary one; disconnect
+the extra identical devices and try again.
+
+The output device is named **`<your keyboard name> (KeyResolve)`**, shortened if
+necessary to fit the kernel's name limit. Linux still assigns its `/dev/input/eventX`
+node automatically; the device's display name is what appears in input-device
+lists. KeyResolve excludes its own virtual devices from the picker.
+
+To select/save a device without the service prompt:
+
+```bash
+./KeyResolve setup --no-service
+```
+
+## systemd user service
+
+During setup, choose the service option, or select/save a keyboard and install it
+in one command:
+
+```bash
+./KeyResolve setup --service
+```
+
+If a keyboard is already saved, you can install the service separately:
+
+```bash
+./KeyResolve service install
+```
+
+Setup copies the executable to
+`$XDG_DATA_HOME/keyresolve/bin/KeyResolve` (normally
+`~/.local/share/keyresolve/bin/KeyResolve`) and writes
+`$XDG_CONFIG_HOME/systemd/user/keyresolve.service`. The unit points at the saved
+configuration explicitly. It starts at your next login and restarts on failure;
+no system-wide service or root-owned KeyResolve process is installed.
+
+Manage it with:
+
+```bash
+systemctl --user status keyresolve.service
+journalctl --user -u keyresolve.service -f
+systemctl --user restart keyresolve.service
+systemctl --user stop keyresolve.service
+```
+
+After rebuilding or changing the saved device, run `./KeyResolve service install`
+again to update the installed executable/unit and restart the service. If you ran
+setup while an old foreground instance was running, stop that instance first.
+
+To stop, disable, and remove the service and its copied executable:
+
+```bash
+./KeyResolve service uninstall
+```
+
+This keeps your saved keyboard configuration. The service starts on **login**,
+not before login; enabling lingering is not required or done automatically.
 
 ## Usage
 
-Run the program:
+After setup, run:
 
 ```bash
 ./KeyResolve
 ```
 
-You will be prompted to select which keyboard to grab.
+For noninteractive use with an existing saved configuration:
+
+```bash
+./KeyResolve run
+# Optional alternate configuration:
+./KeyResolve run --config /absolute/path/to/config.toml
+```
 
 Once running:
 
@@ -132,7 +231,7 @@ Contributions are welcome!
 Good areas to help with:
 
 * Generalizing key-pair handling
-* Adding configuration support
+* Extending configuration options
 * Improving documentation
 * Testing on different keyboards
 * Packaging (Arch / Nix / etc.)
