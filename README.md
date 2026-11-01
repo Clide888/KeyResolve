@@ -6,7 +6,7 @@ Fork Of Antosser/KeyResolve, Just More Daily drivable in my opinion
 
 # BUILD FROM SOURCE ONLY
 
-You need the Original Project's Dependencies
+You need the Original Project's Dependencies and Extra steps before executing the built result
 
 # features that were not in the original project but is in this fork:
 
