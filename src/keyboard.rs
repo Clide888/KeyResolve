@@ -214,7 +214,8 @@ pub fn select_and_save(keyboards: &[KeyboardCandidate], config_path: &Path) -> R
     };
 
     let candidate = &keyboards[selected];
-    let config = Config::new(candidate.identity.clone());
+    let mut config = previous.unwrap_or_else(|| Config::new(candidate.identity.clone()));
+    config.keyboard = candidate.identity.clone();
     config.save(config_path)?;
     println!("Saved keyboard: {}", config.keyboard.name);
     println!("Configuration: {}", config_path.display());
@@ -267,25 +268,6 @@ fn emit_key(vdev: &mut VirtualDevice, key: KeyCode, value: i32) -> Result<()> {
         .context("Failed to write to the virtual keyboard")
 }
 
-fn handle_axis_pair(
-    vdev: &mut VirtualDevice,
-    pressed_keys: &mut AttributeSet<KeyCode>,
-    pressed: bool,
-    this_down: &mut bool,
-    other_down: bool,
-    this_key: KeyCode,
-    other_key: KeyCode,
-) -> Result<()> {
-    *this_down = pressed;
-    emit_key(vdev, this_key, pressed as i32)?;
-    set_key_state(pressed_keys, this_key, pressed);
-    if other_down {
-        emit_key(vdev, other_key, (!pressed) as i32)?;
-        set_key_state(pressed_keys, other_key, !pressed);
-    }
-    Ok(())
-}
-
 fn set_key_state(pressed_keys: &mut AttributeSet<KeyCode>, key: KeyCode, pressed: bool) {
     if pressed {
         pressed_keys.insert(key);
@@ -303,6 +285,7 @@ pub fn run_session(
     path: &Path,
     device: &mut Device,
     running: &Arc<AtomicBool>,
+    pairs: &[crate::config::KeyPair],
 ) -> Result<SessionExit> {
     // Create output before taking exclusive access to the physical keyboard.
     let mut vdev = create_virtual_keyboard(device)?;
@@ -315,7 +298,7 @@ pub fn run_session(
     })?;
     println!("Grabbed {} — KeyResolve is running.", path.display());
 
-    let result = run_event_loop(device, &mut vdev, running);
+    let result = run_event_loop(device, &mut vdev, running, pairs);
     // The evdev Device also ungrabs on drop, including on an error path.
     let ungrab = device.ungrab();
     drop(vdev);
@@ -333,8 +316,9 @@ fn run_event_loop(
     device: &mut Device,
     vdev: &mut VirtualDevice,
     running: &Arc<AtomicBool>,
+    pairs: &[crate::config::KeyPair],
 ) -> Result<()> {
-    let mut state = KeyState::default();
+    let mut state = KeyState::new(pairs);
     let result = process_events(device, vdev, running, &mut state);
     // Release forwarded keys before removing the virtual device, including on
     // service stop or a read error, so applications do not see stuck movement.
@@ -344,13 +328,44 @@ fn run_event_loop(
     result
 }
 
-#[derive(Default)]
+struct PairState {
+    keys: [KeyCode; 2],
+    down: [bool; 2],
+    winner: Option<usize>,
+}
+
 struct KeyState {
-    a_down: bool,
-    d_down: bool,
-    w_down: bool,
-    s_down: bool,
+    pairs: Vec<PairState>,
     pressed: AttributeSet<KeyCode>,
+}
+
+impl KeyState {
+    fn new(pairs: &[crate::config::KeyPair]) -> Self {
+        Self {
+            pairs: pairs.iter().map(|pair| PairState {
+                keys: pair.keys.map(KeyCode::new), down: [false; 2], winner: None,
+            }).collect(),
+            pressed: AttributeSet::default(),
+        }
+    }
+}
+
+// Return only changes to the virtual key state; releasing a suppressed key
+// must not release the currently active key or spuriously re-press it.
+fn pair_event(pair: &mut PairState, index: usize, down: bool) -> Vec<(KeyCode, i32)> {
+    if pair.down[index] == down { return Vec::new(); }
+    pair.down[index] = down;
+    let old = pair.winner;
+    let new = if down { Some(index) } else if old == Some(index) {
+        let other = 1 - index;
+        pair.down[other].then_some(other)
+    } else { old };
+    pair.winner = new;
+    if old == new { return Vec::new(); }
+    let mut events = Vec::new();
+    if let Some(old) = old { events.push((pair.keys[old], 0)); }
+    if let Some(new) = new { events.push((pair.keys[new], 1)); }
+    events
 }
 
 fn process_events(
@@ -383,54 +398,47 @@ fn process_events(
                 vdev.emit(&[event])?;
                 continue;
             }
-            if event.value() != 0 && event.value() != 1 {
-                continue;
-            }
-            let pressed = event.value() == 1;
             let key = KeyCode::new(event.code());
-            match key {
-                KeyCode::KEY_A => handle_axis_pair(
-                    vdev,
-                    &mut state.pressed,
-                    pressed,
-                    &mut state.a_down,
-                    state.d_down,
-                    KeyCode::KEY_A,
-                    KeyCode::KEY_D,
-                )?,
-                KeyCode::KEY_D => handle_axis_pair(
-                    vdev,
-                    &mut state.pressed,
-                    pressed,
-                    &mut state.d_down,
-                    state.a_down,
-                    KeyCode::KEY_D,
-                    KeyCode::KEY_A,
-                )?,
-                KeyCode::KEY_W => handle_axis_pair(
-                    vdev,
-                    &mut state.pressed,
-                    pressed,
-                    &mut state.w_down,
-                    state.s_down,
-                    KeyCode::KEY_W,
-                    KeyCode::KEY_S,
-                )?,
-                KeyCode::KEY_S => handle_axis_pair(
-                    vdev,
-                    &mut state.pressed,
-                    pressed,
-                    &mut state.s_down,
-                    state.w_down,
-                    KeyCode::KEY_S,
-                    KeyCode::KEY_W,
-                )?,
-                _ => {
+            if let Some(pair) = state.pairs.iter_mut().find(|pair| pair.keys.contains(&key)) {
+                if event.value() == 0 || event.value() == 1 {
+                    let index = usize::from(pair.keys[1] == key);
+                    for (key, value) in pair_event(pair, index, event.value() == 1) {
+                        emit_key(vdev, key, value)?;
+                        set_key_state(&mut state.pressed, key, value == 1);
+                    }
+                } else if event.value() == 2 && pair.winner.is_some_and(|i| pair.keys[i] == key) {
                     vdev.emit(&[event])?;
-                    set_key_state(&mut state.pressed, key, pressed);
+                }
+            } else {
+                vdev.emit(&[event])?;
+                if event.value() == 0 || event.value() == 1 {
+                    set_key_state(&mut state.pressed, key, event.value() == 1);
                 }
             }
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod pair_tests {
+    use super::*;
+    #[test]
+    fn last_press_wins_and_suppressed_release_does_not_affect_winner() {
+        let mut state = KeyState::new(&crate::config::default_pairs());
+        let pair = &mut state.pairs[0];
+        assert_eq!(pair_event(pair, 0, true), vec![(KeyCode::KEY_A, 1)]);
+        assert_eq!(pair_event(pair, 1, true), vec![(KeyCode::KEY_A, 0), (KeyCode::KEY_D, 1)]);
+        assert!(pair_event(pair, 0, false).is_empty());
+        assert_eq!(pair_event(pair, 1, false), vec![(KeyCode::KEY_D, 0)]);
+        assert!(pair_event(pair, 1, false).is_empty());
+    }
+    #[test]
+    fn releasing_winner_restores_held_key() {
+        let mut state = KeyState::new(&crate::config::default_pairs());
+        let pair = &mut state.pairs[1];
+        pair_event(pair, 0, true);
+        pair_event(pair, 1, true);
+        assert_eq!(pair_event(pair, 1, false), vec![(KeyCode::KEY_S, 0), (KeyCode::KEY_W, 1)]);
+    }
 }

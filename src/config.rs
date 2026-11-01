@@ -13,6 +13,34 @@ const CONFIG_VERSION: u32 = 1;
 pub struct Config {
     pub version: u32,
     pub keyboard: SavedKeyboard,
+    #[serde(default = "default_pairs")]
+    pub pairs: Vec<KeyPair>,
+}
+
+/// Linux evdev key codes for two mutually exclusive keys.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct KeyPair {
+    pub keys: [u16; 2],
+}
+
+pub fn default_pairs() -> Vec<KeyPair> {
+    vec![KeyPair { keys: [30, 32] }, KeyPair { keys: [17, 31] }]
+}
+
+pub fn validate_pairs(pairs: &[KeyPair]) -> Result<()> {
+    let mut seen = std::collections::HashSet::new();
+    for pair in pairs {
+        for &key in &pair.keys {
+            // KEY_MAX is 0x2ff in Linux input-event-codes.h; KEY_RESERVED is not usable.
+            if key == 0 || key > 0x2ff {
+                bail!("Invalid Linux key code {key} (expected 1..=767)");
+            }
+            if !seen.insert(key) {
+                bail!("Key code {key} occurs more than once; pairs must not overlap");
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Keep hardware identity as well as the last event node. Event numbers are not
@@ -125,6 +153,7 @@ impl Config {
         Self {
             version: CONFIG_VERSION,
             keyboard,
+            pairs: default_pairs(),
         }
     }
 
@@ -145,10 +174,12 @@ impl Config {
                 path.display()
             );
         }
+        validate_pairs(&config.pairs).with_context(|| format!("Invalid key pairs in {}", path.display()))?;
         Ok(Some(config))
     }
 
     pub fn save(&self, path: &Path) -> Result<()> {
+        validate_pairs(&self.pairs)?;
         let parent = path
             .parent()
             .filter(|parent| !parent.as_os_str().is_empty())
@@ -225,6 +256,19 @@ mod tests {
             physical_path: Some("usb-0000:00:14.0-2/input0".into()),
             unique_name: None,
         }
+    }
+
+    #[test]
+    fn legacy_and_custom_pairs() {
+        let config = Config::new(keyboard());
+        let mut legacy = toml::Value::try_from(&config).unwrap();
+        legacy.as_table_mut().unwrap().remove("pairs");
+        let loaded: Config = legacy.try_into().unwrap();
+        assert_eq!(loaded.pairs, default_pairs());
+        assert!(validate_pairs(&[KeyPair { keys: [30, 30] }]).is_err());
+        assert!(validate_pairs(&[KeyPair { keys: [0, 30] }]).is_err());
+        assert!(validate_pairs(&[KeyPair { keys: [30, 32] }, KeyPair { keys: [32, 17] }]).is_err());
+        assert!(validate_pairs(&[]).is_ok());
     }
 
     #[test]

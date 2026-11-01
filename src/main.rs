@@ -2,6 +2,7 @@ mod config;
 mod keyboard;
 mod permissions;
 mod service;
+mod tui;
 
 use anyhow::{Context, Result, bail};
 use config::Config;
@@ -25,6 +26,7 @@ Usage:
   KeyResolve setup               Select/save a keyboard; optionally install a user service
   KeyResolve setup --service     Select/save a keyboard and install the user service
   KeyResolve setup --no-service  Select/save a keyboard without the service prompt
+  KeyResolve tui [--config PATH] Edit Snap Tap key pairs in a terminal menu
   KeyResolve run [--config PATH] Use the saved keyboard without interactive prompts
   KeyResolve service install     Install, enable, and start the systemd user service
   KeyResolve service uninstall   Stop/disable/remove the service, keeping configuration
@@ -82,6 +84,8 @@ fn run_command() -> Result<()> {
             let config = require_config(path)?;
             run(config, path)
         }
+        ["tui"] => tui::run(&config_path),
+        ["tui", "--config", path] => tui::run(Path::new(path)),
         ["setup", "--service"] => setup(&config_path, Some(true)).map(|_| ()),
         ["setup", "--no-service"] => setup(&config_path, Some(false)).map(|_| ()),
         ["setup"] => setup(&config_path, None).map(|_| ()),
@@ -223,11 +227,20 @@ fn run(mut config: Config, config_path: &Path) -> Result<()> {
             config.keyboard.last_path = path.clone();
             // Event numbers can change. Keep the hint current, but do not stop
             // working if the existing configuration is temporarily read-only.
-            if let Err(error) = config.save(config_path) {
+            let update = Config::load(config_path).and_then(|current| {
+                if let Some(mut current) = current {
+                    if current.keyboard.matches(&path, &device) {
+                        current.keyboard.last_path = path.clone();
+                        current.save(config_path)?;
+                    }
+                }
+                Ok(())
+            });
+            if let Err(error) = update {
                 eprintln!("Warning: could not update the saved event path: {error:#}");
             }
         }
-        match keyboard::run_session(&path, &mut device, &running) {
+        match keyboard::run_session(&path, &mut device, &running, &config.pairs) {
             Ok(SessionExit::Stopped) => break,
             Ok(SessionExit::Disconnected) => {
                 println!("Keyboard disconnected; waiting for the same keyboard to return.");
