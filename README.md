@@ -8,4 +8,8 @@ Fork Of Antosser/KeyResolve, Just More Daily drivable in my opinion
 
 You need the Original Project's Dependencies
 
-It adds systemd usermode service integration and also the ability for the tool to remember what device you used 
+# features that were not in the original project but is in this fork:
+
+- Systemd Usermode Service integration
+- TUI for configuring snap tap key pairs
+- Remembers your device and reuses it
